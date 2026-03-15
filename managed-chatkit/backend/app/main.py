@@ -47,6 +47,7 @@ async def create_session(request: Request) -> JSONResponse:
     workflow_id = resolve_workflow_id(body)
     if not workflow_id:
         return respond({"error": "Missing workflow id"}, 400)
+    state_variables = resolve_workflow_state_variables(body)
 
     user_id, cookie_value = resolve_user(request.cookies)
     api_base = chatkit_api_base()
@@ -60,7 +61,17 @@ async def create_session(request: Request) -> JSONResponse:
                     "OpenAI-Beta": "chatkit_beta=v1",
                     "Content-Type": "application/json",
                 },
-                json={"workflow": {"id": workflow_id}, "user": user_id},
+                json={
+                    "workflow": {
+                        "id": workflow_id,
+                        **(
+                            {"state_variables": state_variables}
+                            if state_variables
+                            else {}
+                        ),
+                    },
+                    "user": user_id,
+                },
             )
     except httpx.RequestError as error:
         return respond(
@@ -188,6 +199,20 @@ def resolve_workflow_id(body: Mapping[str, Any]) -> str | None:
     if workflow_id and isinstance(workflow_id, str) and workflow_id.strip():
         return workflow_id.strip()
     return None
+
+
+def resolve_workflow_state_variables(body: Mapping[str, Any]) -> dict[str, Any]:
+    workflow = body.get("workflow", {})
+    state_variables = {}
+    if isinstance(workflow, Mapping):
+        raw_state = workflow.get("state_variables", {})
+        if isinstance(raw_state, Mapping):
+            state_variables = {
+                str(key): value
+                for key, value in raw_state.items()
+                if isinstance(value, (str, int, float, bool))
+            }
+    return state_variables
 
 
 def resolve_user(cookies: Mapping[str, str]) -> tuple[str, str | None]:

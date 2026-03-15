@@ -8,15 +8,6 @@ export function ChatKitPanel() {
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
   const [documentError, setDocumentError] = useState<string | null>(null);
 
-  const getClientSecret = useMemo(
-    () => createClientSecretFetcher(workflowId),
-    []
-  );
-
-  const chatkit = useChatKit({
-    api: { getClientSecret },
-  });
-
   async function handleUploadDocument(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -121,9 +112,32 @@ export function ChatKitPanel() {
         ) : null}
       </section>
 
-      <div className="flex h-[90vh] w-full rounded-2xl bg-white shadow-sm transition-colors dark:bg-slate-900">
-        <ChatKit control={chatkit.control} className="h-full w-full" />
-      </div>
+      <ChatKitSession vectorStoreId={vectorStoreId} />
+    </div>
+  );
+}
+
+function ChatKitSession({ vectorStoreId }: { vectorStoreId: string }) {
+  const getClientSecret = useMemo(
+    () =>
+      createClientSecretFetcher(
+        workflowId,
+        undefined,
+        vectorStoreId ? { vector_store_id: vectorStoreId } : undefined
+      ),
+    [vectorStoreId]
+  );
+
+  const chatkit = useChatKit({
+    api: { getClientSecret },
+  });
+
+  return (
+    <div
+      key={vectorStoreId || "default-session"}
+      className="flex h-[90vh] w-full rounded-2xl bg-white shadow-sm transition-colors dark:bg-slate-900"
+    >
+      <ChatKit control={chatkit.control} className="h-full w-full" />
     </div>
   );
 }

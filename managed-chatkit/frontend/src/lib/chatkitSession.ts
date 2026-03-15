@@ -2,6 +2,7 @@ const readEnvString = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
 const apiBaseUrl = readEnvString(import.meta.env.VITE_API_URL);
+type WorkflowStateVariables = Record<string, string | number | boolean>;
 
 export const workflowId = (() => {
   const id = readEnvString(import.meta.env.VITE_CHATKIT_WORKFLOW_ID);
@@ -15,7 +16,8 @@ export function createClientSecretFetcher(
   workflow: string,
   endpoint = apiBaseUrl
     ? `${apiBaseUrl.replace(/\/$/, "")}/api/create-session`
-    : "/api/create-session"
+    : "/api/create-session",
+  stateVariables?: WorkflowStateVariables
 ) {
   return async (currentSecret: string | null) => {
     if (currentSecret) return currentSecret;
@@ -23,7 +25,12 @@ export function createClientSecretFetcher(
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workflow: { id: workflow } }),
+      body: JSON.stringify({
+        workflow: {
+          id: workflow,
+          ...(stateVariables ? { state_variables: stateVariables } : {}),
+        },
+      }),
     });
 
     const payload = (await response.json().catch(() => ({}))) as {
