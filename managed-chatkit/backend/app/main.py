@@ -102,7 +102,12 @@ async def create_session(request: Request) -> JSONResponse:
         )
 
     return respond(
-        {"client_secret": client_secret, "expires_after": expires_after},
+        {
+            "client_secret": client_secret,
+            "expires_after": expires_after,
+            "debug_state_variables": state_variables,
+            "debug_vector_store_id": state_variables.get("vector_store_id"),
+        },
         200,
         cookie_value,
     )
