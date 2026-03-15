@@ -20,6 +20,115 @@ SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
 MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
 SUPPORTED_DOCUMENT_TYPES = {".txt", ".md", ".pdf", ".docx"}
 DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
+INTENT_LABELS = {"qa", "explain", "plan", "quiz"}
+
+IDENTIFIER_PROMPT = """You are an identifier agent for a study assistant.
+Classify the user's latest request into exactly one label:
+- qa: the user wants factual answers grounded in the document
+- explain: the user wants a concept explained simply
+- plan: the user wants a study plan or schedule
+- quiz: the user wants quiz questions, review questions, or answer evaluation
+
+Use the recent conversation for context. Reply with only one lowercase label:
+qa, explain, plan, or quiz."""
+
+QA_PROMPT = """You are a document analysis assistant.
+Use the uploaded documents available through file search. These documents may vary between sessions. Always retrieve relevant passages before giving an answer.
+
+Your task is to answer the user's question using the retrieved passages from the uploaded document(s).
+Rules:
+1) Treat the retrieved passages as the primary source of truth.
+2) Base your answer only on the provided document content whenever possible.
+3) If the answer is not clearly supported by the retrieved passages, say: "I cannot find a clear answer in the provided document."
+4) Do not invent facts that are not present in the document.
+5) When useful, quote short excerpts from the passages to support your answer.
+6) If possible, mention the section, chapter, or page where the information appears.
+7) Keep the answer concise, structured, and factual.
+
+Output format:
+Answer
+
+Evidence
+
+Notes (optional)"""
+
+EXPLAIN_PROMPT = """You are a study assistant helping the user understand difficult concepts in the document.
+Use the uploaded documents available through file search. These documents may vary between sessions. Always retrieve relevant passages before giving an answer.
+Use the retrieved document passages as the foundation of your explanation.
+Steps:
+Identify the concept or term referenced in the document.
+Briefly explain what the document says about it.
+Provide a clear and simple explanation in plain language.
+If helpful, include a short example or analogy.
+Distinguish clearly between:
+what the document states
+your general explanation.
+Rules:
+1) Do not contradict the document.
+2) Do not invent claims about the document that are not supported by the retrieved passages. If the retrieved passages do not contain the answer, respond that the information is not present in the uploaded document.
+3) Keep explanations clear and accessible.
+
+Output format:
+What the document says
+Explanation
+Example (optional)"""
+
+PLAN_PROMPT = """You are a study planner helping the user learn the material in the document.
+Use the uploaded documents available through file search. These documents may vary between sessions. Always retrieve relevant passages before giving an answer.
+Use the retrieved passages to understand the document's main topics and structure.
+Steps:
+Identify the main themes or sections of the material.
+Break the content into manageable study units.
+Create a structured study plan.
+Rules:
+1) Focus on understanding rather than memorization.
+2) Include review and practice.
+3) Adapt the plan to the timeframe mentioned by the user.
+
+Output format:
+Study Plan
+Day 1
+Read:
+Focus:
+Exercise:
+Day 2
+Read:
+Focus:
+Exercise:
+Continue for the requested duration.
+Final Review
+Summarize the most important ideas.
+Suggest a short self-test."""
+
+QUIZ_PROMPT = """You are a study coach helping the user review the document.
+Use the uploaded documents available through file search. These documents may vary between sessions. Always retrieve relevant passages before giving an answer.
+Use the retrieved passages to generate quiz questions based only on the document content.
+Rules:
+1) Questions must be grounded in the retrieved passages. If the retrieved passages do not contain the answer, respond that the information is not present in the uploaded document.
+2) Do not ask about material that is not present in the document.
+3) Questions should test comprehension rather than trivial details.
+4) In a multiple choice part, multiple answers could be correct.
+5) Prefer a mix of question types:
+- short answer
+- conceptual explanation
+- key definition
+6) Keep the difficulty appropriate for someone learning the material.
+
+If the user is answering a quiz you previously gave, compare the user's answers with the retrieved document passages.
+Evaluate correctness and provide feedback.
+
+Output format for creating questions:
+Quiz Questions
+Instructions to the user: Answer the questions and I will check your responses.
+
+Output format for evaluating answers:
+Evaluation
+Question 1
+User answer:
+Assessment: Correct / Partially correct / Incorrect
+Explanation:
+Repeat for each question.
+Finish with a brief summary of the user's understanding and suggestions for improvement."""
 
 app = FastAPI(title="Managed ChatKit Session API")
 
@@ -58,22 +167,22 @@ async def chat(request: Request) -> JSONResponse:
     api_base = responses_api_base()
     model = os.getenv("OPENAI_CHAT_MODEL") or DEFAULT_CHAT_MODEL
     prompt = build_chat_prompt(history, message)
-
     try:
-        async with httpx.AsyncClient(base_url=api_base, timeout=30.0) as client:
+        async with httpx.AsyncClient(
+            base_url=api_base,
+            timeout=30.0,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        ) as client:
+            intent = await classify_intent(client, model, history, message)
             upstream = await client.post(
                 "/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
                 json={
                     "model": model,
                     "input": prompt,
-                    "instructions": (
-                        "Use file search results as the primary source. "
-                        "Answer clearly and say when the document does not contain the answer."
-                    ),
+                    "instructions": prompt_for_intent(intent),
                     "tools": [
                         {
                             "type": "file_search",
@@ -108,7 +217,7 @@ async def chat(request: Request) -> JSONResponse:
         return respond({"error": "Missing text in model response"}, 502, cookie_value)
 
     return respond(
-        {"answer": answer},
+        {"answer": answer, "intent": intent},
         200,
         cookie_value,
     )
@@ -254,6 +363,59 @@ def build_chat_prompt(history: list[dict[str, str]], message: str) -> str:
         "Assistant: Answer the user's latest question using the uploaded document."
     )
     return "\n".join(transcript)
+
+
+async def classify_intent(
+    client: httpx.AsyncClient,
+    model: str,
+    history: list[dict[str, str]],
+    message: str,
+) -> str:
+    classifier_input = build_chat_prompt(history, message)
+
+    try:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": model,
+                "input": classifier_input,
+                "instructions": IDENTIFIER_PROMPT,
+            },
+        )
+    except httpx.RequestError:
+        return classify_intent_heuristically(history, message)
+
+    payload = parse_json(response)
+    label = (extract_response_text(payload) or "").strip().lower()
+    if label in INTENT_LABELS:
+        return label
+    return classify_intent_heuristically(history, message)
+
+
+def classify_intent_heuristically(
+    history: list[dict[str, str]], message: str
+) -> str:
+    text = f"{' '.join(entry['content'] for entry in history[-4:])} {message}".lower()
+
+    if any(keyword in text for keyword in ["quiz", "questions", "multiple choice"]):
+        return "quiz"
+    if any(keyword in text for keyword in ["my answers", "check my answers", "evaluate", "assessment:"]):
+        return "quiz"
+    if any(keyword in text for keyword in ["study plan", "plan", "schedule", "days", "week", "weeks"]):
+        return "plan"
+    if any(keyword in text for keyword in ["explain", "why", "how does", "what does this mean", "simple terms"]):
+        return "explain"
+    return "qa"
+
+
+def prompt_for_intent(intent: str) -> str:
+    prompts = {
+        "qa": QA_PROMPT,
+        "explain": EXPLAIN_PROMPT,
+        "plan": PLAN_PROMPT,
+        "quiz": QUIZ_PROMPT,
+    }
+    return prompts.get(intent, QA_PROMPT)
 
 
 def extract_response_text(payload: Mapping[str, Any]) -> str | None:
