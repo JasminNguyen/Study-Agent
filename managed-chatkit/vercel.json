@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run frontend:build",
+  "outputDirectory": "frontend/dist",
+  "functions": {
+    "api/*.py": {
+      "excludeFiles": "{backend/.venv/**,frontend/node_modules/**,docs/**}"
+    }
+  }
+}
