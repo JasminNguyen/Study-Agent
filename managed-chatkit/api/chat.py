@@ -1,4 +1,4 @@
-"""Vercel entrypoint for creating Managed ChatKit sessions."""
+"""Vercel entrypoint for retrieval-backed chat responses."""
 
 from __future__ import annotations
 
@@ -14,12 +14,12 @@ BACKEND_ROOT = PROJECT_ROOT / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.main import create_session
+from app.main import chat
 
 
 app = FastAPI()
 
 
-@app.post("/api/create-session")
-async def create_session_route(request: Request):
-    return await create_session(request)
+@app.post("/api/chat")
+async def chat_route(request: Request):
+    return await chat(request)

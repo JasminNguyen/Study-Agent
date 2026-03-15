@@ -1,11 +1,11 @@
-"""FastAPI entrypoint for exchanging workflow ids for ChatKit client secrets."""
+"""FastAPI entrypoint for document upload and retrieval chat."""
 
 from __future__ import annotations
 
 import json
 import os
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import httpx
 from fastapi import FastAPI, File, Request, UploadFile
@@ -19,6 +19,7 @@ SESSION_COOKIE_NAME = "chatkit_session_id"
 SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
 MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
 SUPPORTED_DOCUMENT_TYPES = {".txt", ".md", ".pdf", ".docx"}
+DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
 
 app = FastAPI(title="Managed ChatKit Session API")
 
@@ -36,78 +37,78 @@ async def health() -> Mapping[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/create-session")
-async def create_session(request: Request) -> JSONResponse:
-    """Exchange a workflow id for a ChatKit client secret."""
+@app.post("/api/chat")
+async def chat(request: Request) -> JSONResponse:
+    """Answer a user question using file search over an uploaded document."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return respond({"error": "Missing OPENAI_API_KEY environment variable"}, 500)
 
     body = await read_json_body(request)
-    workflow_id = resolve_workflow_id(body)
-    if not workflow_id:
-        return respond({"error": "Missing workflow id"}, 400)
-    state_variables = resolve_workflow_state_variables(body)
+    message = read_non_empty_string(body.get("message"))
+    vector_store_id = read_non_empty_string(body.get("vector_store_id"))
+    history = normalize_chat_history(body.get("history"))
+
+    if not vector_store_id:
+        return respond({"error": "Missing vector_store_id"}, 400)
+    if not message:
+        return respond({"error": "Missing message"}, 400)
 
     user_id, cookie_value = resolve_user(request.cookies)
-    api_base = chatkit_api_base()
+    api_base = responses_api_base()
+    model = os.getenv("OPENAI_CHAT_MODEL") or DEFAULT_CHAT_MODEL
+    prompt = build_chat_prompt(history, message)
 
     try:
-        async with httpx.AsyncClient(base_url=api_base, timeout=10.0) as client:
+        async with httpx.AsyncClient(base_url=api_base, timeout=30.0) as client:
             upstream = await client.post(
-                "/v1/chatkit/sessions",
+                "/v1/responses",
                 headers={
                     "Authorization": f"Bearer {api_key}",
-                    "OpenAI-Beta": "chatkit_beta=v1",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "workflow": {
-                        "id": workflow_id,
-                        **(
-                            {"state_variables": state_variables}
-                            if state_variables
-                            else {}
-                        ),
-                    },
-                    "user": user_id,
+                    "model": model,
+                    "input": prompt,
+                    "instructions": (
+                        "Use file search results as the primary source. "
+                        "Answer clearly and say when the document does not contain the answer."
+                    ),
+                    "tools": [
+                        {
+                            "type": "file_search",
+                            "vector_store_ids": [vector_store_id],
+                            "max_num_results": 8,
+                        }
+                    ],
+                    "metadata": {"chat_session_user": user_id},
                 },
             )
     except httpx.RequestError as error:
         return respond(
-            {"error": f"Failed to reach ChatKit API: {error}"},
+            {"error": f"Failed to reach OpenAI Responses API: {error}"},
             502,
             cookie_value,
         )
 
     payload = parse_json(upstream)
     if not upstream.is_success:
-        message = None
+        error_message = None
         if isinstance(payload, Mapping):
-            message = payload.get("error")
-        message = message or upstream.reason_phrase or "Failed to create session"
-        return respond({"error": message}, upstream.status_code, cookie_value)
+            error_payload = payload.get("error")
+            if isinstance(error_payload, Mapping):
+                error_message = read_non_empty_string(error_payload.get("message"))
+            elif isinstance(error_payload, str):
+                error_message = error_payload
+        error_message = error_message or upstream.reason_phrase or "Failed to create response"
+        return respond({"error": error_message}, upstream.status_code, cookie_value)
 
-    client_secret = None
-    expires_after = None
-    if isinstance(payload, Mapping):
-        client_secret = payload.get("client_secret")
-        expires_after = payload.get("expires_after")
-
-    if not client_secret:
-        return respond(
-            {"error": "Missing client secret in response"},
-            502,
-            cookie_value,
-        )
+    answer = extract_response_text(payload)
+    if not answer:
+        return respond({"error": "Missing text in model response"}, 502, cookie_value)
 
     return respond(
-        {
-            "client_secret": client_secret,
-            "expires_after": expires_after,
-            "debug_state_variables": state_variables,
-            "debug_vector_store_id": state_variables.get("vector_store_id"),
-        },
+        {"answer": answer},
         200,
         cookie_value,
     )
@@ -190,36 +191,6 @@ async def read_json_body(request: Request) -> Mapping[str, Any]:
     return parsed if isinstance(parsed, Mapping) else {}
 
 
-def resolve_workflow_id(body: Mapping[str, Any]) -> str | None:
-    workflow = body.get("workflow", {})
-    workflow_id = None
-    if isinstance(workflow, Mapping):
-        workflow_id = workflow.get("id")
-    workflow_id = workflow_id or body.get("workflowId")
-    env_workflow = os.getenv("CHATKIT_WORKFLOW_ID") or os.getenv(
-        "VITE_CHATKIT_WORKFLOW_ID"
-    )
-    if not workflow_id and env_workflow:
-        workflow_id = env_workflow
-    if workflow_id and isinstance(workflow_id, str) and workflow_id.strip():
-        return workflow_id.strip()
-    return None
-
-
-def resolve_workflow_state_variables(body: Mapping[str, Any]) -> dict[str, Any]:
-    workflow = body.get("workflow", {})
-    state_variables = {}
-    if isinstance(workflow, Mapping):
-        raw_state = workflow.get("state_variables", {})
-        if isinstance(raw_state, Mapping):
-            state_variables = {
-                str(key): value
-                for key, value in raw_state.items()
-                if isinstance(value, (str, int, float, bool))
-            }
-    return state_variables
-
-
 def resolve_user(cookies: Mapping[str, str]) -> tuple[str, str | None]:
     existing = cookies.get(SESSION_COOKIE_NAME)
     if existing:
@@ -228,7 +199,7 @@ def resolve_user(cookies: Mapping[str, str]) -> tuple[str, str | None]:
     return user_id, user_id
 
 
-def chatkit_api_base() -> str:
+def responses_api_base() -> str:
     return (
         os.getenv("CHATKIT_API_BASE")
         or os.getenv("VITE_CHATKIT_API_BASE")
@@ -248,3 +219,66 @@ def file_extension(filename: str) -> str:
     if "." not in filename:
         return ""
     return f".{filename.rsplit('.', 1)[-1].lower()}"
+
+
+def read_non_empty_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def normalize_chat_history(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role = read_non_empty_string(item.get("role"))
+        content = read_non_empty_string(item.get("content"))
+        if role not in {"user", "assistant"} or not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def build_chat_prompt(history: list[dict[str, str]], message: str) -> str:
+    transcript: list[str] = []
+    for entry in history[-8:]:
+        speaker = "User" if entry["role"] == "user" else "Assistant"
+        transcript.append(f"{speaker}: {entry['content']}")
+
+    transcript.append(f"User: {message}")
+    transcript.append(
+        "Assistant: Answer the user's latest question using the uploaded document."
+    )
+    return "\n".join(transcript)
+
+
+def extract_response_text(payload: Mapping[str, Any]) -> str | None:
+    direct_text = read_non_empty_string(payload.get("output_text"))
+    if direct_text:
+        return direct_text
+
+    output = payload.get("output")
+    if not isinstance(output, Sequence):
+        return None
+
+    text_fragments: list[str] = []
+    for item in output:
+        if not isinstance(item, Mapping):
+            continue
+        content = item.get("content")
+        if not isinstance(content, Sequence):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            text_value = read_non_empty_string(part.get("text"))
+            if text_value:
+                text_fragments.append(text_value)
+
+    if not text_fragments:
+        return None
+    return "\n".join(text_fragments)
