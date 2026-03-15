@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-from io import BytesIO
 import json
 import os
 import uuid
 from typing import Any, Mapping
 
 import httpx
-from docx import Document
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pypdf import PdfReader
+
+from app.vector_store import create_user_vector_store
 
 DEFAULT_CHATKIT_BASE = "https://api.openai.com"
 SESSION_COOKIE_NAME = "chatkit_session_id"
 SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
-MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
 SUPPORTED_DOCUMENT_TYPES = {".txt", ".md", ".pdf", ".docx"}
 
 app = FastAPI(title="Managed ChatKit Session API")
@@ -100,7 +99,7 @@ async def create_session(request: Request) -> JSONResponse:
 
 @app.post("/api/upload-document")
 async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
-    """Extract plain text from a supported uploaded document."""
+    """Create a vector store from a supported uploaded document."""
     filename = (file.filename or "").strip()
     extension = file_extension(filename)
 
@@ -118,24 +117,28 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
 
     if len(content) > MAX_UPLOAD_SIZE_BYTES:
         return respond(
-            {"error": "Uploaded file is too large. Maximum size is 10 MB."},
+            {"error": "Uploaded file is too large. Maximum size is 25 MB."},
             400,
         )
 
     try:
-        text = extract_document_text(content, extension)
-    except ValueError as error:
-        return respond({"error": str(error)}, 400)
+        vector_store_id = create_user_vector_store(
+            content,
+            filename or f"document{extension}",
+        )
     except Exception:
         return respond(
-            {"error": "We couldn't read that file. Try a different document."},
-            400,
+            {"error": "We couldn't upload that file to the vector store right now."},
+            502,
         )
 
-    if not text.strip():
-        return respond({"error": "No readable text was found in that document."}, 400)
-
-    return respond({"filename": filename or f"document{extension}", "text": text}, 200)
+    return respond(
+        {
+            "filename": filename or f"document{extension}",
+            "vector_store_id": vector_store_id,
+        },
+        200,
+    )
 
 
 def respond(
@@ -215,34 +218,3 @@ def file_extension(filename: str) -> str:
     if "." not in filename:
         return ""
     return f".{filename.rsplit('.', 1)[-1].lower()}"
-
-
-def extract_document_text(content: bytes, extension: str) -> str:
-    if extension in {".txt", ".md"}:
-        return decode_text_file(content)
-    if extension == ".pdf":
-        return extract_pdf_text(content)
-    if extension == ".docx":
-        return extract_docx_text(content)
-    raise ValueError("Unsupported file type.")
-
-
-def decode_text_file(content: bytes) -> str:
-    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            return content.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Unable to decode that text file.")
-
-
-def extract_pdf_text(content: bytes) -> str:
-    reader = PdfReader(BytesIO(content))
-    pages = [(page.extract_text() or "").strip() for page in reader.pages]
-    return "\n\n".join(page for page in pages if page)
-
-
-def extract_docx_text(content: bytes) -> str:
-    document = Document(BytesIO(content))
-    paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs]
-    return "\n".join(paragraph for paragraph in paragraphs if paragraph)
